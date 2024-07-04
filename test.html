@@ -1,0 +1,206 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Visualización de Filtrado de Abejas</title>
+    <style>
+        div {
+            display: flex;
+            margin: auto;
+        }
+    </style>
+</head>
+<body>
+    <div>
+        <video id="video" width="640" height="480" controls>
+            <source src="./bee-alarmed-example3.mp4" type="video/mp4">
+        </video>
+        <canvas id="canvas" width="640" height="480"></canvas>
+        <canvas id="filteredCanvas" width="640" height="480"></canvas>
+    </div>
+    <script async src="https://docs.opencv.org/4.x/opencv.js" onload="onOpenCvReady();"></script>
+    <script>
+        function onOpenCvReady() {
+            var beesIn = 0;
+            var beesOut = 0;
+            let video = document.getElementById('video');
+            let canvas = document.getElementById('canvas');
+            let filteredCanvas = document.getElementById('filteredCanvas');
+            let ctx = canvas.getContext('2d');
+            let filteredCtx = filteredCanvas.getContext('2d');
+
+            let src, hsv, greenChannel, diff, blurred, normalized, inverted, thresholded;
+            let beeIdCounter = 0;
+            let bees = {};
+
+            video.addEventListener('play', () => {
+                src = new cv.Mat(video.height, video.width, cv.CV_8UC4);
+                hsv = new cv.Mat(video.height, video.width, cv.CV_8UC3);
+                greenChannel = new cv.Mat(video.height, video.width, cv.CV_8UC1);
+                diff = new cv.Mat(video.height, video.width, cv.CV_8UC1);
+                blurred = new cv.Mat(video.height, video.width, cv.CV_8UC1);
+                normalized = new cv.Mat(video.height, video.width, cv.CV_8UC1);
+                inverted = new cv.Mat(video.height, video.width, cv.CV_8UC1);
+                thresholded = new cv.Mat(video.height, video.width, cv.CV_8UC1);
+
+                processVideo();
+            });
+
+            function processVideo() {
+                if (video.paused || video.ended) {
+                    src.delete();
+                    hsv.delete();
+                    greenChannel.delete();
+                    diff.delete();
+                    blurred.delete();
+                    normalized.delete();
+                    inverted.delete();
+                    thresholded.delete();
+                    return;
+                }
+
+                // Capture the frame
+                ctx.drawImage(video, 0, 0, video.width, video.height);
+                src.data.set(ctx.getImageData(0, 0, video.width, video.height).data);
+
+                // Convert to HSV (using constant value)
+                cv.cvtColor(src, hsv, cv.COLOR_RGBA2RGB);
+                cv.cvtColor(hsv, hsv, cv.COLOR_RGB2HSV); // Convert to HSV from RGB
+
+                // Extract the V channel (brightness) and the Green channel from RGB
+                let channels = new cv.MatVector();
+                cv.split(hsv, channels);
+                let vChannel = channels.get(2); // V channel
+                cv.split(src, channels);
+                let gChannel = channels.get(1); // Green channel
+
+                // Crear una matriz con el valor constante (en este caso, 0.5)
+                let scaleFactor = new cv.Mat(vChannel.rows, vChannel.cols, vChannel.type(), new cv.Scalar(0.5));
+
+                // Multiplicar el canal verde por el factor de escala
+                cv.multiply(gChannel, scaleFactor, gChannel);
+
+                // Liberar la matriz de factor de escala después de su uso
+                scaleFactor.delete();
+
+                // Restar el canal verde modificado del canal V
+                cv.subtract(vChannel, gChannel, diff);
+
+                // Apply threshold to get a binary image
+                cv.threshold(diff, thresholded, 127, 255, cv.THRESH_BINARY);
+
+                // Normalize the image to make the contrast higher
+                cv.normalize(thresholded, normalized, 0, 255, cv.NORM_MINMAX);
+
+                // Invert the colors so bees are black and background is white
+                cv.bitwise_not(normalized, inverted);
+
+                // Apply Gaussian blur
+                cv.GaussianBlur(inverted, blurred, new cv.Size(23, 23), 0, 0, cv.BORDER_DEFAULT);
+
+                // Apply threshold to get a binary image
+                cv.threshold(blurred, thresholded, 127, 255, cv.THRESH_BINARY);
+
+                // Find contours (objects in motion)
+                let contours = new cv.MatVector();
+                let hierarchy = new cv.Mat();
+                cv.findContours(thresholded, contours, hierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
+
+                // Draw contours and track movement
+                for (let i = 0; i < contours.size(); i++) {
+                    try {
+                        let cnt = contours.get(i);
+                        let rect = cv.boundingRect(cnt);
+                
+                        if (rect.width > 25 && rect.height > 25 && rect.width < 75 && rect.height < 150) { // filter by size
+                            // Calculate the center of the rectangle
+                            let centerX = rect.x + rect.width / 2;
+                            let centerY = rect.y + rect.height / 2;
+                
+                            // Define the axes lengths of the ellipse
+                            let axisLengthX = rect.width / 2;
+                            let axisLengthY = rect.height / 2;
+                
+                            let beeDetected = false;
+                            let beeColor, beeName;
+                
+                            // Check if this bee is already being tracked
+                            for (let id in bees) {
+                                let bee = bees[id];
+                                if (Math.abs(bee.x - centerX) < 50 && Math.abs(bee.y - centerY) < 50) {
+                                    // Update bee position
+                                    bees[id] = { ...bee, x: centerX, y: centerY, frames: 0 };
+                                    beeDetected = true;
+                                    beeColor = bee.color;
+                                    beeName = bee.name;
+                                    // Check for entry or exit
+                                    if (centerY > video.height - 50 && bee.y <= video.height - 50) {
+                                        beesIn++;
+                                        console.log(`Abeja ${id} entrando`);
+                                    } else if (centerY < 50 && bee.y >= 50) {
+                                        beesOut++;
+                                        console.log(`Abeja ${id} saliendo`);
+                                    }
+                                    break;
+                                }
+                            }
+                
+                            if (!beeDetected) {
+                                // New bee detected
+                                beeColor = getRandomColor();
+                                beeName = getRandomName();
+                                bees[beeIdCounter] = { x: centerX, y: centerY, frames: 0, color: beeColor, name: beeName };
+                                beeIdCounter++;
+                            }
+                
+                            // Draw the ellipse
+                            cv.ellipse(src, new cv.Point(centerX, centerY), new cv.Size(axisLengthX, axisLengthY), 0, 0, 360, beeColor, 2);
+                
+                            // Draw the name near the ellipse
+                            cv.putText(src, beeName, new cv.Point(centerX - axisLengthX, centerY - axisLengthY - 10), cv.FONT_HERSHEY_TRIPLEX, 0.7, beeColor, 1);
+                        }
+                    } catch (error) {
+                        console.error("Error al ajustar la elipse:", error);
+                    }
+                }
+
+                // Update bee tracking data
+                for (let id in bees) {
+                    bees[id].frames++;
+                    // Remove bees that have been invisible for too long
+                    if (bees[id].frames > 30) {
+                        delete bees[id];
+                    }
+                }
+
+                // Show the filtered result
+                cv.imshow('filteredCanvas', thresholded);
+
+                // Show the original video frame for comparison
+                cv.imshow('canvas', src);
+
+                // Schedule next frame processing
+                requestAnimationFrame(processVideo);
+
+                // Cleanup
+                channels.delete();
+                console.log('beesIn: ' + beesIn);
+                console.log('beesOut: ' + beesOut);
+            }
+        }
+
+        function getRandomColor() {
+            // Generar valores aleatorios para los canales rojo, verde y azul
+            let r = Math.floor(Math.random() * 256);
+            let g = Math.floor(Math.random() * 256);
+            let b = Math.floor(Math.random() * 256);
+            return new cv.Scalar(r, g, b, 255); // Retorna un color en formato Scalar con opacidad completa
+        }
+
+        function getRandomName() {
+            const names = ["Lara", "Luisina", "Valentin", "Kevin", "Paola", "Dante", "Axel", "Sol", "Rocio", "Gaspar", "Magdalena", "Justina", "Sofia", "Simon", "Candela", "Ignacio", "Agustin", "Ivan", "Laura", "Nicole", "Sebastian", "Leonardo", "Carmen", "Antonio", "Yago", "Eliana", "Victoria", "Macarena", "Pilar", "Renata", "Ramona", "Isabel", "Martina", "Delfina", "Joaquin", "Carolina", "Luciano", "Tatiana", "Carlos", "Felipe", "David", "Maria", "Gabriel", "Franco", "Sara", "Agustina", "Esteban", "Aaron", "Martin", "Alejandro", "Daniela", "Paloma", "Violeta", "Gabriela", "Sonia", "Fernando", "Manuela", "Aitana", "Ignacia", "Sabrina", "Lautaro", "Patricia", "Monica", "Rafael", "Barbara", "Mariana", "Eugenia", "Marcela", "Mateo", "Cecilia", "Julieta", "Santiago", "Enzo", "Lourdes", "Camila", "Clara", "Susana", "Bruno", "Ramiro", "Cristian", "Andres", "Francisco", "Pedro", "Monica", "Cesar", "Julieta", "Thiago", "Tomas", "Valeria", "Jeronimo", "Beatriz", "Daniel", "Milagros", "Andrea", "Pablo", "Benjamin", "Naiara", "Axel", "Florencia", "Brenda", "Alejandro", "Manuel", "Nicolas", "Emanuel", "Amparo", "Dolores", "Malena", "Gabriela", "Ramiro", "Gonzalo", "Lucas", "Sara", "Catalina", "Javier", "Julian", "Agustina", "Yamila", "Elena", "Carla", "Samira", "Jazmin", "Eva", "Juan", "Lucia", "Gisela", "Clara", "Irene", "Jose", "Diego", "Ivan", "Belen", "Gonzalo", "Hugo", "Nicole", "Eduardo", "Renata", "Sofia", "Zoe", "Nadia", "Justina", "Melina", "Leandro", "Federico", "Antonio", "Gabriel", "Luis", "Josefina", "Luis", "Victoria", "Nora", "Candela", "Ana", "Ignacia", "Laura", "Monica", "Esteban", "Jorge", "Tamara", "Carla", "Salma", "Tatiana", "Marcos", "Carmen", "Bruno", "Omar", "Gustavo", "Leonardo"];
+            return names[Math.floor(Math.random() * names.length)];
+        }
+        
+    </script>
+</body>
+</html>
